@@ -210,7 +210,7 @@ Guidelines for different diagnostic levels:
     an error. For example `unused_comparisons` (out of bounds comparisons) or
     `bindings_with_variant_name` (the user likely did not intend to create a
     binding in a pattern).
-  - [Future-incompatible lints](#future-incompatible), where something was
+  - [Future-incompatible lints](#future-incompatible-lints), where something was
     accidentally or erroneously accepted in the past, but rejecting would
     cause excessive breakage in the ecosystem.
   - Stylistic choices. For example, camel or snake case, or the `dyn` trait
