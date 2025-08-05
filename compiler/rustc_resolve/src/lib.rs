@@ -41,7 +41,6 @@ use rustc_ast::{
     self as ast, AngleBracketedArg, CRATE_NODE_ID, Crate, Expr, ExprKind, GenericArg, GenericArgs,
     LitKind, NodeId, Path, attr,
 };
-use rustc_attr_data_structures::StrippedCfgItem;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::steal::Steal;
@@ -50,6 +49,7 @@ use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_errors::{Applicability, Diag, ErrCode, ErrorGuaranteed};
 use rustc_expand::base::{DeriveResolution, SyntaxExtension, SyntaxExtensionKind};
 use rustc_feature::BUILTIN_ATTRIBUTES;
+use rustc_hir::attrs::StrippedCfgItem;
 use rustc_hir::def::Namespace::{self, *};
 use rustc_hir::def::{
     self, CtorOf, DefKind, DocLinkResMap, LifetimeRes, NonMacroAttrKind, PartialRes, PerNS,
@@ -64,8 +64,8 @@ use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::query::Providers;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{
-    self, DelegationFnSig, Feed, MainDefinition, RegisteredTools, ResolverGlobalCtxt,
-    ResolverOutputs, TyCtxt, TyCtxtFeed, Visibility,
+    self, DelegationFnSig, Feed, MainDefinition, RegisteredTools, ResolverAstLowering,
+    ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
 };
 use rustc_query_system::ich::StableHashingContext;
 use rustc_session::lint::builtin::PRIVATE_MACRO_USE;
@@ -1009,13 +1009,13 @@ impl<'ra> NameBindingData<'ra> {
 
 #[derive(Default, Clone)]
 struct ExternPreludeEntry<'ra> {
-    binding: Option<NameBinding<'ra>>,
+    binding: Cell<Option<NameBinding<'ra>>>,
     introduced_by_item: bool,
 }
 
 impl ExternPreludeEntry<'_> {
     fn is_import(&self) -> bool {
-        self.binding.is_some_and(|binding| binding.is_import())
+        self.binding.get().is_some_and(|binding| binding.is_import())
     }
 }
 
@@ -1035,6 +1035,11 @@ impl MacroData {
     fn new(ext: Arc<SyntaxExtension>) -> MacroData {
         MacroData { ext, nrules: 0, macro_rules: false }
     }
+}
+
+pub struct ResolverOutputs {
+    pub global_ctxt: ResolverGlobalCtxt,
+    pub ast_lowering: ResolverAstLowering,
 }
 
 /// The main resolver class.
@@ -1482,13 +1487,23 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let mut invocation_parents = FxHashMap::default();
         invocation_parents.insert(LocalExpnId::ROOT, InvocationParent::ROOT);
 
-        let mut extern_prelude: FxIndexMap<Ident, ExternPreludeEntry<'_>> = tcx
+        let mut extern_prelude: FxIndexMap<_, _> = tcx
             .sess
             .opts
             .externs
             .iter()
-            .filter(|(_, entry)| entry.add_prelude)
-            .map(|(name, _)| (Ident::from_str(name), Default::default()))
+            .filter_map(|(name, entry)| {
+                // Make sure `self`, `super`, `_` etc do not get into extern prelude.
+                // FIXME: reject `--extern self` and similar in option parsing instead.
+                if entry.add_prelude
+                    && let name = Symbol::intern(name)
+                    && name.can_be_raw()
+                {
+                    Some((Ident::with_dummy_span(name), Default::default()))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         if !attr::contains_name(attrs, sym::no_core) {
@@ -2006,7 +2021,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             // but not introduce it, as used if they are accessed from lexical scope.
             if used == Used::Scope {
                 if let Some(entry) = self.extern_prelude.get(&ident.normalize_to_macros_2_0()) {
-                    if !entry.introduced_by_item && entry.binding == Some(used_binding) {
+                    if !entry.introduced_by_item && entry.binding.get() == Some(used_binding) {
                         return;
                     }
                 }
@@ -2163,40 +2178,42 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     }
 
     fn extern_prelude_get(&mut self, ident: Ident, finalize: bool) -> Option<NameBinding<'ra>> {
-        if ident.is_path_segment_keyword() {
-            // Make sure `self`, `super` etc produce an error when passed to here.
-            return None;
-        }
-
-        let norm_ident = ident.normalize_to_macros_2_0();
-        let binding = self.extern_prelude.get(&norm_ident).cloned().and_then(|entry| {
-            Some(if let Some(binding) = entry.binding {
+        let mut record_use = None;
+        let entry = self.extern_prelude.get(&ident.normalize_to_macros_2_0());
+        let binding = entry.and_then(|entry| match entry.binding.get() {
+            Some(binding) if binding.is_import() => {
                 if finalize {
-                    if !entry.is_import() {
-                        self.cstore_mut().process_path_extern(self.tcx, ident.name, ident.span);
-                    } else if entry.introduced_by_item {
-                        self.record_use(ident, binding, Used::Other);
-                    }
+                    record_use = Some(binding);
                 }
-                binding
-            } else {
+                Some(binding)
+            }
+            Some(binding) => {
+                if finalize {
+                    self.cstore_mut().process_path_extern(self.tcx, ident.name, ident.span);
+                }
+                Some(binding)
+            }
+            None => {
                 let crate_id = if finalize {
-                    let Some(crate_id) =
-                        self.cstore_mut().process_path_extern(self.tcx, ident.name, ident.span)
-                    else {
-                        return Some(self.dummy_binding);
-                    };
-                    crate_id
+                    self.cstore_mut().process_path_extern(self.tcx, ident.name, ident.span)
                 } else {
-                    self.cstore_mut().maybe_process_path_extern(self.tcx, ident.name)?
+                    self.cstore_mut().maybe_process_path_extern(self.tcx, ident.name)
                 };
-                let res = Res::Def(DefKind::Mod, crate_id.as_def_id());
-                self.arenas.new_pub_res_binding(res, DUMMY_SP, LocalExpnId::ROOT)
-            })
+                match crate_id {
+                    Some(crate_id) => {
+                        let res = Res::Def(DefKind::Mod, crate_id.as_def_id());
+                        let binding =
+                            self.arenas.new_pub_res_binding(res, DUMMY_SP, LocalExpnId::ROOT);
+                        entry.binding.set(Some(binding));
+                        Some(binding)
+                    }
+                    None => finalize.then_some(self.dummy_binding),
+                }
+            }
         });
 
-        if let Some(entry) = self.extern_prelude.get_mut(&norm_ident) {
-            entry.binding = binding;
+        if let Some(binding) = record_use {
+            self.record_use(ident, binding, Used::Scope);
         }
 
         binding
